@@ -20,31 +20,88 @@ DEFAULT_MODEL_REPO = "openbmb/MiniCPM5-1B-GGUF"
 DEFAULT_MODEL_FILE = "MiniCPM5-1B-Q4_K_M.gguf"
 MODEL_CACHE_DIR = Path.home() / ".hermes" / "mnemosyne" / "models"
 
-LLM_ENABLED = os.environ.get("MNEMOSYNE_LLM_ENABLED", "true").lower() in ("1", "true", "yes")
-LLM_MAX_TOKENS=int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")
-LLM_N_THREADS = int(os.environ.get("MNEMOSYNE_LLM_N_THREADS", "4"))
-LLM_N_CTX = int(os.environ.get("MNEMOSYNE_LLM_N_CTX", "2048"))
+# --- Setting resolution: env var > config.yaml > default ---------------------
+# Historically every LLM setting below was read from os.environ ONLY, so a
+# mnemosyne config.yaml value was silently ignored for consolidation. We now
+# resolve each setting with an explicit precedence:
+#
+#     1. environment variable   (MNEMOSYNE_* -- highest priority; deploy override)
+#     2. config.yaml            (via MnemosyneConfig.get())
+#     3. hardcoded default
+#
+# NOTE: this is intentionally the *opposite* of MnemosyneConfig.get()'s own
+# "config.yaml > env" precedence. For the consolidation LLM we want a plain
+# exported env var to win, matching 12-factor deploy overrides. The config file
+# is consulted only when the env var is absent, so a config.yaml value is now
+# "properly utilized" instead of being dead. To make the config file win for a
+# given setting, simply leave the corresponding env var unset.
+def _resolve(config_key: str, env_var: str, default, cast=None):
+    """Resolve one setting with env > config.yaml > default precedence.
 
-# Override model via env
-_env_repo = os.environ.get("MNEMOSYNE_LLM_REPO")
-_env_file = os.environ.get("MNEMOSYNE_LLM_FILE")
+    ``config_key`` is the snake_case MnemosyneConfig key (no MNEMOSYNE_ prefix);
+    ``env_var`` is the full environment variable name. ``cast`` optionally
+    coerces the raw value (str/…) to the desired type. Any failure to read the
+    config layer degrades gracefully to env-or-default so import can never break.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None:
+        try:
+            from mnemosyne.core.config import get_config
+            val = get_config().get(config_key)
+            # get() returns the YAML value if present, else its own env/default
+            # fallback (None here since we pass no default) -- treat "" as unset
+            # so a blank config line falls through to our default.
+            if val is not None and val != "":
+                raw = val
+        except Exception:
+            raw = None
+    if raw is None:
+        return default
+    if cast is None:
+        return raw
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_bool(config_key: str, env_var: str, default: bool) -> bool:
+    val = _resolve(config_key, env_var, None)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes")
+
+
+LLM_ENABLED = _resolve_bool("llm_enabled", "MNEMOSYNE_LLM_ENABLED", True)
+LLM_MAX_TOKENS = _resolve("llm_max_tokens", "MNEMOSYNE_LLM_MAX_TOKENS", 2048, int)
+LLM_N_THREADS = _resolve("llm_n_threads", "MNEMOSYNE_LLM_N_THREADS", 4, int)
+LLM_N_CTX = _resolve("llm_n_ctx", "MNEMOSYNE_LLM_N_CTX", 2048, int)
+
+# Override GGUF model via env/config (repo + file must both be set together)
+_env_repo = _resolve("llm_repo", "MNEMOSYNE_LLM_REPO", None)
+_env_file = _resolve("llm_file", "MNEMOSYNE_LLM_FILE", None)
 if _env_repo and _env_file:
     DEFAULT_MODEL_REPO = _env_repo
     DEFAULT_MODEL_FILE = _env_file
 
 # Remote API config
-LLM_BASE_URL = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "").rstrip("/")
-LLM_API_KEY = os.environ.get("MNEMOSYNE_LLM_API_KEY", "")
-LLM_REMOTE_MODEL = os.environ.get("MNEMOSYNE_LLM_MODEL", "")
-LLM_TIMEOUT = float(os.environ.get("MNEMOSYNE_LLM_TIMEOUT", "60"))
+LLM_BASE_URL = str(_resolve("llm_base_url", "MNEMOSYNE_LLM_BASE_URL", "")).rstrip("/")
+LLM_API_KEY = str(_resolve("llm_api_key", "MNEMOSYNE_LLM_API_KEY", ""))
+LLM_REMOTE_MODEL = str(_resolve("llm_model", "MNEMOSYNE_LLM_MODEL", ""))
+LLM_TIMEOUT = _resolve("llm_timeout", "MNEMOSYNE_LLM_TIMEOUT", 60.0, float)
 
 # Retryable errors only: 404/400 (model-not-found), 5xx, connection. Not 401/403/429.
 LLM_FALLBACK_MODELS = [
-    m.strip() for m in os.environ.get("MNEMOSYNE_LLM_FALLBACK_MODELS", "").split(",")
+    m.strip()
+    for m in str(_resolve("llm_fallback_models", "MNEMOSYNE_LLM_FALLBACK_MODELS", "")).split(",")
     if m.strip()
 ]
-LLM_FALLBACK_BASE_URL = os.environ.get("MNEMOSYNE_LLM_FALLBACK_BASE_URL", "").rstrip("/") or LLM_BASE_URL
-LLM_FALLBACK_API_KEY = os.environ.get("MNEMOSYNE_LLM_FALLBACK_API_KEY", "") or LLM_API_KEY
+LLM_FALLBACK_BASE_URL = str(
+    _resolve("llm_fallback_base_url", "MNEMOSYNE_LLM_FALLBACK_BASE_URL", "")
+).rstrip("/") or LLM_BASE_URL
+LLM_FALLBACK_API_KEY = str(
+    _resolve("llm_fallback_api_key", "MNEMOSYNE_LLM_FALLBACK_API_KEY", "")
+) or LLM_API_KEY
 
 # Host LLM adapter (Hermes or another agent). Disabled by default to preserve
 # existing standalone behavior. When MNEMOSYNE_HOST_LLM_ENABLED=true and a
@@ -504,37 +561,80 @@ def _call_remote_llm_with_model(
         "stream": False
     }
 
-    try:
+    # Some hosted models (notably the OpenAI GPT-5 family exposed via gateways
+    # such as Argonne's Argo) reject optional sampling params: they 400 with
+    # "Unsupported parameter: 'stop' ..." or refuse any non-default
+    # temperature. Rather than maintain a per-model allow-list, we send the
+    # full payload once and, on a 400 that names an unsupported/unknown
+    # parameter, transparently retry with that parameter removed. Local GGUF
+    # and permissive OpenAI-compatible servers keep the original happy path.
+    _OPTIONAL_TUNABLES = ("stop", "temperature", "top_p", "frequency_penalty", "presence_penalty")
+
+    def _strip_unsupported(body: dict, err_text: str) -> "Optional[dict]":
+        """Return a copy of body with the offending optional param removed.
+
+        Returns None when no known-optional param can be dropped (so the
+        caller stops retrying and surfaces the original error).
+        """
+        low = (err_text or "").lower()
+        if "unsupported" not in low and "unknown" not in low and "not supported" not in low:
+            return None
+        for param in _OPTIONAL_TUNABLES:
+            if param in body and (f"'{param}'" in low or f'"{param}"' in low or f" {param} " in low):
+                trimmed = dict(body)
+                trimmed.pop(param, None)
+                return trimmed
+        return None
+
+    def _post(body: dict):
+        """Single POST. Returns (data_or_None, status_or_None, exc_or_None, err_text)."""
         if has_httpx:
             with httpx.Client(timeout=timeout) as client:
-                response = client.post(url, json=payload, headers=headers)
+                response = client.post(url, json=body, headers=headers)
                 status = response.status_code
+                err_text = response.text if status >= 400 else ""
                 if status >= 400:
                     try:
                         response.raise_for_status()
                     except Exception as exc:
-                        return (None, status, exc)
+                        return (None, status, exc, err_text)
                 try:
-                    data = response.json()
+                    return (response.json(), status, None, "")
                 except Exception as exc:
-                    return (None, status, exc)
+                    return (None, status, exc, "")
         else:
             import urllib.request
             import urllib.error
             req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode(),
-                headers=headers,
-                method="POST"
+                url, data=json.dumps(body).encode(), headers=headers, method="POST"
             )
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     status = getattr(resp, "status", 200)
-                    data = json.loads(resp.read().decode())
+                    return (json.loads(resp.read().decode()), status, None, "")
             except urllib.error.HTTPError as exc:
-                return (None, exc.code, exc)
+                try:
+                    err_text = exc.read().decode(errors="replace")
+                except Exception:
+                    err_text = str(exc)
+                return (None, exc.code, exc, err_text)
             except Exception as exc:
-                return (None, None, exc)
+                return (None, None, exc, "")
+
+    try:
+        data, status, exc, err_text = _post(payload)
+        # Retry loop: drop unsupported optional params one at a time (bounded).
+        attempts = 0
+        while data is None and status == 400 and attempts < len(_OPTIONAL_TUNABLES):
+            trimmed = _strip_unsupported(payload, err_text)
+            if trimmed is None:
+                break
+            payload = trimmed
+            attempts += 1
+            data, status, exc, err_text = _post(payload)
+
+        if data is None:
+            return (None, status, exc)
 
         choices = data.get("choices", []) if isinstance(data, dict) else []
         if choices and choices[0].get("message", {}).get("content"):

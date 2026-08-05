@@ -1,3 +1,4 @@
+import builtins
 import os
 import subprocess
 import sys
@@ -595,3 +596,195 @@ class TestRemoteLLMFallback:
             fb_call = m.call_args_list[1]
             assert fb_call.kwargs["base_url"] == "http://primary/v1"
             assert fb_call.kwargs["api_key"] == "primary-key"
+
+
+class TestSettingResolution:
+    """Precedence for LLM settings: env var > config.yaml > default.
+
+    Regression guard for the fork fix that made config.yaml actually get
+    used by the consolidation path (previously env-only). Env must still win
+    so 12-factor deploy overrides keep working.
+    """
+
+    def test_resolve_env_wins_over_config(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_LLM_MODEL", "env-model")
+
+        class FakeCfg:
+            def get(self, key, default=None):
+                return "config-model" if key == "llm_model" else default
+
+        monkeypatch.setattr(
+            "mnemosyne.core.config.get_config", lambda: FakeCfg(), raising=False
+        )
+        assert local_llm._resolve("llm_model", "MNEMOSYNE_LLM_MODEL", "") == "env-model"
+
+    def test_resolve_config_wins_when_env_absent(self, monkeypatch):
+        monkeypatch.delenv("MNEMOSYNE_LLM_MODEL", raising=False)
+
+        class FakeCfg:
+            def get(self, key, default=None):
+                return "config-model" if key == "llm_model" else default
+
+        monkeypatch.setattr(
+            "mnemosyne.core.config.get_config", lambda: FakeCfg(), raising=False
+        )
+        assert local_llm._resolve("llm_model", "MNEMOSYNE_LLM_MODEL", "def") == "config-model"
+
+    def test_resolve_default_when_neither_set(self, monkeypatch):
+        monkeypatch.delenv("MNEMOSYNE_LLM_TIMEOUT", raising=False)
+
+        class FakeCfg:
+            def get(self, key, default=None):
+                return default  # nothing configured
+
+        monkeypatch.setattr(
+            "mnemosyne.core.config.get_config", lambda: FakeCfg(), raising=False
+        )
+        assert local_llm._resolve("llm_timeout", "MNEMOSYNE_LLM_TIMEOUT", 60.0, float) == 60.0
+
+    def test_resolve_blank_config_falls_through_to_default(self, monkeypatch):
+        """An empty-string config value must not shadow the hardcoded default."""
+        monkeypatch.delenv("MNEMOSYNE_LLM_BASE_URL", raising=False)
+
+        class FakeCfg:
+            def get(self, key, default=None):
+                return ""  # blank YAML line
+
+        monkeypatch.setattr(
+            "mnemosyne.core.config.get_config", lambda: FakeCfg(), raising=False
+        )
+        assert local_llm._resolve("llm_base_url", "MNEMOSYNE_LLM_BASE_URL", "fallback") == "fallback"
+
+    def test_resolve_cast_int_from_config_string(self, monkeypatch):
+        """YAML may hand back a str for a numeric key; cast must coerce it."""
+        monkeypatch.delenv("MNEMOSYNE_LLM_MAX_TOKENS", raising=False)
+
+        class FakeCfg:
+            def get(self, key, default=None):
+                return "1024" if key == "llm_max_tokens" else default
+
+        monkeypatch.setattr(
+            "mnemosyne.core.config.get_config", lambda: FakeCfg(), raising=False
+        )
+        val = local_llm._resolve("llm_max_tokens", "MNEMOSYNE_LLM_MAX_TOKENS", 2048, int)
+        assert val == 1024 and isinstance(val, int)
+
+    def test_resolve_degrades_when_config_import_fails(self, monkeypatch):
+        """If the config layer raises, fall back to env-or-default, never crash."""
+        monkeypatch.delenv("MNEMOSYNE_LLM_MODEL", raising=False)
+
+        def boom():
+            raise RuntimeError("config unavailable")
+
+        monkeypatch.setattr(
+            "mnemosyne.core.config.get_config", boom, raising=False
+        )
+        assert local_llm._resolve("llm_model", "MNEMOSYNE_LLM_MODEL", "safe-default") == "safe-default"
+
+
+class TestUnsupportedParamRetry:
+    """GPT-5-family endpoints (e.g. Argo gpt56sol) 400 on 'stop' and any
+    non-default 'temperature'. _call_remote_llm_with_model must transparently
+    shed those optional params and retry, without a per-model allow-list.
+    """
+
+    def _make_httpx(self, responses):
+        """Build a mock httpx module whose Client.post yields the given
+        (status_code, json_body, text) tuples in order."""
+        posts = {"bodies": []}
+
+        def post(url, json=None, headers=None):
+            posts["bodies"].append(json)
+            status, body, text = responses[len(posts["bodies"]) - 1]
+            resp = MagicMock()
+            resp.status_code = status
+            resp.text = text
+            resp.json.return_value = body
+            if status >= 400:
+                def _raise():
+                    raise Exception(f"HTTP {status}")
+                resp.raise_for_status = _raise
+            else:
+                resp.raise_for_status = lambda: None
+            return resp
+
+        client = MagicMock()
+        client.post.side_effect = post
+        client.__enter__ = lambda s: s
+        client.__exit__ = lambda *a: None
+        mod = MagicMock()
+        mod.Client = MagicMock(return_value=client)
+        return mod, posts
+
+    def test_sheds_stop_then_temperature_then_succeeds(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_MAX_TOKENS", 128)
+        err_stop = '{"error":{"message":"Unsupported parameter: \'stop\' is not supported with this model."}}'
+        err_temp = '{"error":{"message":"Unsupported parameter: \'temperature\' is not supported with this model."}}'
+        ok = {"choices": [{"message": {"content": "clean summary"}}]}
+        mod, posts = self._make_httpx([
+            (400, None, err_stop),
+            (400, None, err_temp),
+            (200, ok, ""),
+        ])
+
+        _orig = builtins.__import__
+        def fake_import(name, *a, **k):
+            if name == "httpx":
+                return mod
+            return _orig(name, *a, **k)
+
+        with patch("builtins.__import__", fake_import):
+            text, status, exc = local_llm._call_remote_llm_with_model(
+                "p", "gpt56sol", 0.3, base_url="http://argo/v1", api_key="k", timeout=5,
+            )
+
+        assert text == "clean summary"
+        assert status == 200 and exc is None
+        # 3 attempts total
+        assert len(posts["bodies"]) == 3
+        # first payload had both; final payload had neither
+        assert "stop" in posts["bodies"][0] and "temperature" in posts["bodies"][0]
+        assert "stop" not in posts["bodies"][2]
+        assert "temperature" not in posts["bodies"][2]
+
+    def test_gives_up_on_400_with_no_known_param(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_MAX_TOKENS", 128)
+        err_other = '{"error":{"message":"context length exceeded"}}'
+        mod, posts = self._make_httpx([(400, None, err_other)])
+
+        _orig = builtins.__import__
+        def fake_import(name, *a, **k):
+            if name == "httpx":
+                return mod
+            return _orig(name, *a, **k)
+
+        with patch("builtins.__import__", fake_import):
+            text, status, exc = local_llm._call_remote_llm_with_model(
+                "p", "gpt56sol", 0.3, base_url="http://argo/v1", api_key="k", timeout=5,
+            )
+
+        assert text is None and status == 400
+        # only ONE attempt: nothing to strip -> no retry storm
+        assert len(posts["bodies"]) == 1
+
+    def test_happy_path_unchanged_for_permissive_server(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_MAX_TOKENS", 128)
+        ok = {"choices": [{"message": {"content": "ok"}}]}
+        mod, posts = self._make_httpx([(200, ok, "")])
+
+        _orig = builtins.__import__
+        def fake_import(name, *a, **k):
+            if name == "httpx":
+                return mod
+            return _orig(name, *a, **k)
+
+        with patch("builtins.__import__", fake_import):
+            text, status, exc = local_llm._call_remote_llm_with_model(
+                "p", "local-model", 0.3, base_url="http://llama/v1", api_key="", timeout=5,
+            )
+
+        assert text == "ok" and status == 200
+        # single attempt, stop+temperature still present (no regression)
+        assert len(posts["bodies"]) == 1
+        assert "stop" in posts["bodies"][0]
+        assert "temperature" in posts["bodies"][0]
